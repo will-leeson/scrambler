@@ -82,6 +82,41 @@ enum annotation_mode { none, pattern, all };
 bool no_scramble = false;
 
 /*
+ * If set to true, intra-assertion term transformations (commutative argument
+ * shuffling and antisymmetric operator flipping) will not be applied.
+ * Assertion reordering and variable renaming are unaffected.
+ */
+bool no_term_scramble = false;
+
+/*
+ * If set to false, assertion reordering will not be applied.
+ * Variable renaming is unaffected.
+ */
+bool shuffle_asserts = true;
+
+/*
+ * If set to false, declaration reordering will not be applied.
+ * Variable renaming is unaffected.
+ */
+bool shuffle_decls = true;
+
+/*
+ * If set to true, variables are renamed x1, x2, ... in order of first
+ * appearance during printing (rather than by a random permutation of
+ * parse-time IDs).
+ */
+bool sequential_names = false;
+
+/*
+ * If set to true, commands are reordered so that all declare-fun appear first,
+ * followed by all define-fun (in their original relative order), then all
+ * assert commands, then everything else. This makes assertions consecutive so
+ * that -shuffle-asserts works correctly even for files with interleaved
+ * declarations and assertions.
+ */
+bool normalize_structure = false;
+
+/*
  * If *not* set to true, the following modifications will be made additionally:
  * 1. The command (set-option :print-success false) is prepended.
  */
@@ -125,6 +160,15 @@ bool support_z3 = false;
  * If set to true, the system prints the number of assertions to stdout
  */
 bool count_asrts = false;
+
+/*
+ * If non-empty, write a mapping of original assertion index to scrambled
+ * assertion index (0-based, asserts only) to this file.
+ */
+std::string assert_map_file;
+
+// accumulated mapping: (orig_idx, new_idx)
+std::vector<std::pair<size_t, size_t>> assert_map;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -439,6 +483,7 @@ namespace scrambler {
 // if true, else -1.
 int is_commutative(const node *n)
 {
+    if (no_term_scramble) return -1;
     // *n might be a qualified identifier of the form ('as' identifier sort)
     const std::string *symbol = &(n->symbol);
     if (*symbol == "as") {
@@ -489,7 +534,7 @@ int is_commutative(const node *n)
 
 bool flip_antisymm(const node *n, node ** const out_n)
 {
-    if (no_scramble) {
+    if (no_scramble || no_term_scramble) {
         return false;
     }
 
@@ -583,6 +628,11 @@ bool flip_antisymm(const node *n, node ** const out_n)
 // a random permutation of name ids
 std::vector<uint64_t> permuted_name_ids;
 
+// when sequential_names is true, maps parse-time name id -> output name id
+// assigned in order of first appearance during printing
+std::unordered_map<uint64_t, uint64_t> output_name_ids;
+uint64_t next_output_name_id = 1;
+
 // uniform names
 std::string make_name(uint64_t name_id)
 {
@@ -610,6 +660,21 @@ static bool keep_annotation(const scrambler::node *n, annotation_mode keep_annot
     return n->children.size() == 2 && n->children[1]->symbol == ":pattern";
 }
 
+// Recursively assign sequential output name IDs to all names in a node tree,
+// in order of first appearance, without printing anything.
+void assign_names(const scrambler::node *n)
+{
+    if (n->is_name) {
+        uint64_t name_id = get_name_id(n->symbol.c_str());
+        if (name_id != 0 && output_name_ids.find(name_id) == output_name_ids.end()) {
+            output_name_ids[name_id] = next_output_name_id++;
+        }
+    }
+    for (size_t i = 0; i < n->children.size(); ++i) {
+        assign_names(n->children[i]);
+    }
+}
+
 void print_node(std::ostream &out, const scrambler::node *n, annotation_mode keep_annotations)
 {
     if (n->symbol == "!" && !keep_annotation(n, keep_annotations)) {
@@ -621,6 +686,18 @@ void print_node(std::ostream &out, const scrambler::node *n, annotation_mode kee
         if (!n->symbol.empty()) {
             if (no_scramble || !n->is_name) {
                 out << n->symbol;
+            } else if (sequential_names) {
+                uint64_t name_id = get_name_id(n->symbol.c_str());
+                if (name_id == 0) {
+                    out << n->symbol;
+                } else {
+                    auto it = output_name_ids.find(name_id);
+                    if (it == output_name_ids.end()) {
+                        output_name_ids[name_id] = next_output_name_id++;
+                        it = output_name_ids.find(name_id);
+                    }
+                    out << make_name(it->second);
+                }
             } else {
                 uint64_t name_id = get_name_id(n->symbol.c_str());
                 if (name_id == 0) {
@@ -675,65 +752,131 @@ void print_command(std::ostream &out, const scrambler::node *n, annotation_mode 
 
 void print_scrambled(std::ostream &out, annotation_mode keep_annotations)
 {
-    if (!no_scramble) {
-        // identify consecutive declarations and shuffle them
-        for (size_t i = 0; i < commands.size(); ) {
-            if (commands[i]->symbol == "declare-fun") {
-                size_t j = i+1;
-                while (j < commands.size() &&
-                       commands[j]->symbol == "declare-fun") {
-                    ++j;
-                }
-                if (j - i > 1) {
-                    shuffle_list(&commands, i, j);
-                }
-                i = j;
-            } else {
-                ++i;
-            }
-        }
-
-        // identify consecutive assertions and shuffle them
-        for (size_t i = 0; i < commands.size(); ) {
+    // capture original assert order before any shuffling
+    std::vector<scrambler::node *> orig_assert_order;
+    if (!assert_map_file.empty()) {
+        for (size_t i = 0; i < commands.size(); ++i) {
             if (commands[i]->symbol == "assert") {
-                size_t j = i+1;
-                while (j < commands.size() &&
-                       commands[j]->symbol == "assert"){
-                    ++j;
-                }
-                if (j - i > 1) {
-                    shuffle_list(&commands, i, j);
-                }
-                i = j;
+                orig_assert_order.push_back(commands[i]);
+            }
+        }
+    }
+
+    // pre-assign output name IDs in declaration order before any shuffling,
+    // so the mapping is stable regardless of assertion/declaration shuffle order
+    if (sequential_names) {
+        for (size_t i = 0; i < commands.size(); ++i) {
+            assign_names(commands[i]);
+        }
+    }
+
+    if (normalize_structure) {
+        // Reorder commands: preamble (set-logic, set-option, etc.) first,
+        // then declare-fun, then define-fun (relative order preserved),
+        // then assert, then everything else (check-sat, exit, etc.).
+        std::vector<scrambler::node *> preamble, decls, defs, asserts, rest;
+        for (size_t i = 0; i < commands.size(); ++i) {
+            const std::string &sym = commands[i]->symbol;
+            if (sym == "set-logic" || sym == "set-option" || sym == "set-info") {
+                preamble.push_back(commands[i]);
+            } else if (sym == "declare-fun" || sym == "declare-const" || sym == "declare-sort") {
+                decls.push_back(commands[i]);
+            } else if (sym == "define-fun" || sym == "define-sort") {
+                defs.push_back(commands[i]);
+            } else if (sym == "assert") {
+                asserts.push_back(commands[i]);
             } else {
-                ++i;
+                rest.push_back(commands[i]);
+            }
+        }
+        commands.clear();
+        commands.insert(commands.end(), preamble.begin(), preamble.end());
+        commands.insert(commands.end(), decls.begin(), decls.end());
+        commands.insert(commands.end(), defs.begin(), defs.end());
+        commands.insert(commands.end(), asserts.begin(), asserts.end());
+        commands.insert(commands.end(), rest.begin(), rest.end());
+    }
+
+    if (!no_scramble) {
+        if (shuffle_decls) {
+            // identify consecutive declarations and shuffle them
+            for (size_t i = 0; i < commands.size(); ) {
+                if (commands[i]->symbol == "declare-fun") {
+                    size_t j = i+1;
+                    while (j < commands.size() &&
+                           commands[j]->symbol == "declare-fun") {
+                        ++j;
+                    }
+                    if (j - i > 1) {
+                        shuffle_list(&commands, i, j);
+                    }
+                    i = j;
+                } else {
+                    ++i;
+                }
             }
         }
 
-        // Generate a random permutation of name ids. Note that index
-        // 0 is unused in the permuted_name_ids vector (but present to
-        // simplify indexing), and index next_name_id is out of range.
-        size_t old_size = permuted_name_ids.size();
-        assert(old_size <= next_name_id);
-        // Since the print_scrambled function may be called multiple
-        // times (for different parts of the benchmark), we only need
-        // to permute those name ids that have been declared since the
-        // last call to print_scrambled.
-        if (old_size < next_name_id) {
-            permuted_name_ids.reserve(next_name_id);
-            for (size_t i = old_size; i < next_name_id; ++i) {
-                permuted_name_ids.push_back(i);
-                assert(permuted_name_ids[i] == i);
+        if (shuffle_asserts) {
+            // identify consecutive assertions and shuffle them
+            for (size_t i = 0; i < commands.size(); ) {
+                if (commands[i]->symbol == "assert") {
+                    size_t j = i+1;
+                    while (j < commands.size() &&
+                           commands[j]->symbol == "assert"){
+                        ++j;
+                    }
+                    if (j - i > 1) {
+                        shuffle_list(&commands, i, j);
+                    }
+                    i = j;
+                } else {
+                    ++i;
+                }
             }
-            assert(permuted_name_ids.size() == next_name_id);
-            // index 0 must not be shuffled
-            if (old_size == 0) {
-                old_size = 1;
+        }
+
+        if (!sequential_names) {
+            // Generate a random permutation of name ids. Note that index
+            // 0 is unused in the permuted_name_ids vector (but present to
+            // simplify indexing), and index next_name_id is out of range.
+            size_t old_size = permuted_name_ids.size();
+            assert(old_size <= next_name_id);
+            // Since the print_scrambled function may be called multiple
+            // times (for different parts of the benchmark), we only need
+            // to permute those name ids that have been declared since the
+            // last call to print_scrambled.
+            if (old_size < next_name_id) {
+                permuted_name_ids.reserve(next_name_id);
+                for (size_t i = old_size; i < next_name_id; ++i) {
+                    permuted_name_ids.push_back(i);
+                    assert(permuted_name_ids[i] == i);
+                }
+                assert(permuted_name_ids.size() == next_name_id);
+                // index 0 must not be shuffled
+                if (old_size == 0) {
+                    old_size = 1;
+                }
+                // Knuth shuffle
+                for (size_t i = old_size; i < next_name_id - 1; ++i) {
+                    size_t j = i + next_rand_int(next_name_id - i);
+                    std::swap(permuted_name_ids[i], permuted_name_ids[j]);
+                }
             }
-            // Knuth shuffle
-            for (size_t i = old_size; i < next_name_id - 1; ++i) {
-                size_t j = i + next_rand_int(next_name_id - i);
-                std::swap(permuted_name_ids[i], permuted_name_ids[j]);
+        }
+    }
+
+    // compute assert mapping (orig index -> new index) after all shuffles
+    if (!assert_map_file.empty() && !orig_assert_order.empty()) {
+        std::unordered_map<scrambler::node *, size_t> orig_index;
+        for (size_t i = 0; i < orig_assert_order.size(); ++i) {
+            orig_index[orig_assert_order[i]] = i;
+        }
+        size_t new_idx = 0;
+        for (size_t i = 0; i < commands.size(); ++i) {
+            if (commands[i]->symbol == "assert") {
+                assert_map.push_back({orig_index[commands[i]], new_idx});
+                ++new_idx;
             }
         }
     }
@@ -921,7 +1064,37 @@ void usage(const char *program)
               << "\n"
               << "    -count-asserts [true|false]\n"
               << "        controls whether the number of assertions found in the benchmark\n"
-              << "        is printed to stderr (default: false)\n\n";
+              << "        is printed to stderr (default: false)\n"
+              << "\n"
+              << "    -sequential-names [true|false]\n"
+              << "        if true, variables are renamed x1, x2, ... in order of\n"
+              << "        first appearance during printing, rather than by a random\n"
+              << "        permutation (default: false)\n"
+              << "\n"
+              << "    -normalize-structure [true|false]\n"
+              << "        if true, reorder commands so declare-fun comes first,\n"
+              << "        then define-fun, then assert, then check-sat etc.\n"
+              << "        Makes assertions consecutive for reliable shuffling\n"
+              << "        in files with interleaved declarations (default: false)\n"
+              << "\n"
+              << "    -shuffle-asserts [true|false]\n"
+              << "        controls whether assertions are reordered;\n"
+              << "        variable renaming is unaffected (default: true)\n"
+              << "\n"
+              << "    -shuffle-decls [true|false]\n"
+              << "        controls whether declarations are reordered;\n"
+              << "        variable renaming is unaffected (default: true)\n"
+              << "\n"
+              << "    -term-scramble [true|false]\n"
+              << "        controls whether intra-assertion term transformations\n"
+              << "        (commutative argument shuffling, operator flipping) are\n"
+              << "        applied; assertion reordering and renaming are unaffected\n"
+              << "        (default: true)\n"
+              << "\n"
+              << "    -assert-map-file FILE\n"
+              << "        write a mapping of original assertion index to scrambled\n"
+              << "        assertion index (0-based, one entry per line: orig -> new)\n"
+              << "        to the specified FILE\n\n";
     std::cout.flush();
     exit(1);
 }
@@ -1035,6 +1208,54 @@ int main(int argc, char **argv)
                 usage(argv[0]);
             }
             i += 2;
+        } else if (strcmp(argv[i], "-sequential-names") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "true") == 0) {
+                sequential_names = true;
+            } else if (strcmp(argv[i + 1], "false") == 0) {
+                sequential_names = false;
+            } else {
+                usage(argv[0]);
+            }
+            i += 2;
+        } else if (strcmp(argv[i], "-normalize-structure") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "true") == 0) {
+                normalize_structure = true;
+            } else if (strcmp(argv[i + 1], "false") == 0) {
+                normalize_structure = false;
+            } else {
+                usage(argv[0]);
+            }
+            i += 2;
+        } else if (strcmp(argv[i], "-shuffle-asserts") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "true") == 0) {
+                shuffle_asserts = true;
+            } else if (strcmp(argv[i + 1], "false") == 0) {
+                shuffle_asserts = false;
+            } else {
+                usage(argv[0]);
+            }
+            i += 2;
+        } else if (strcmp(argv[i], "-shuffle-decls") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "true") == 0) {
+                shuffle_decls = true;
+            } else if (strcmp(argv[i + 1], "false") == 0) {
+                shuffle_decls = false;
+            } else {
+                usage(argv[0]);
+            }
+            i += 2;
+        } else if (strcmp(argv[i], "-term-scramble") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "true") == 0) {
+                no_term_scramble = false;
+            } else if (strcmp(argv[i + 1], "false") == 0) {
+                no_term_scramble = true;
+            } else {
+                usage(argv[0]);
+            }
+            i += 2;
+        } else if (strcmp(argv[i], "-assert-map-file") == 0 && i + 1 < argc) {
+            assert_map_file = argv[i + 1];
+            i += 2;
         } else {
             usage(argv[0]);
         }
@@ -1100,6 +1321,19 @@ int main(int argc, char **argv)
     }
     if (!commands.empty()) {
         print_scrambled(std::cout, keep_annotations);
+    }
+
+    if (!assert_map_file.empty() && !assert_map.empty()) {
+        std::ofstream map_out(assert_map_file.c_str());
+        if (!map_out) {
+            std::cerr << "ERROR: could not open assert map file: "
+                      << assert_map_file << std::endl;
+            return 1;
+        }
+        for (size_t i = 0; i < assert_map.size(); ++i) {
+            map_out << assert_map[i].first << " -> " << assert_map[i].second
+                    << "\n";
+        }
     }
 
     return 0;
